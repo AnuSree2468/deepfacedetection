@@ -1,0 +1,236 @@
+!pip install labelme tensorflow tensorflow-gpu opencv-python matplotlib albumentations
+
+import os
+import time
+import uuid
+import cv2
+
+IMAGES_PATH = os.path.join('data','images')
+number_images = 30
+cap = cv2.VideoCapture(1)
+
+for imgnum in range(number_images):
+    print('Collecting image {}'.format(imgnum))
+    ret, frame = cap.read()
+    imgname = os.path.join(IMAGES_PATH,f'{str(uuid.uuid1())}.jpg')
+    cv2.imwrite(imgname, frame)
+    cv2.imshow('frame', frame)
+    time.sleep(0.5)
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+
+cap.release()
+cv2.destroyAllWindows()
+
+!labelme
+
+import tensorflow as tf
+import json
+import numpy as np
+from matplotlib import pyplot as plt
+
+gpus = tf.config.experimental.list_physical_devices('GPU')
+for gpu in gpus: 
+    tf.config.experimental.set_memory_growth(gpu, True)
+tf.config.list_physical_devices('GPU')
+
+images = tf.data.Dataset.list_files('data\\images\\*.jpg')
+def load_image(x): 
+    byte_img = tf.io.read_file(x)
+    img = tf.io.decode_jpeg(byte_img)
+    return img
+
+images = images.map(load_image)
+
+image_generator = images.batch(4).as_numpy_iterator()
+plot_images = image_generator.next()
+fig, ax = plt.subplots(ncols=4, figsize=(20,20))
+for idx, image in enumerate(plot_images):
+    ax[idx].imshow(image)
+plt.show()
+
+for folder in ['train','test','val']:
+    for file in os.listdir(os.path.join('data', folder, 'images')):
+        filename = file.split('.')[0]+'.json'
+        existing_filepath = os.path.join('data','labels', filename)
+        if os.path.exists(existing_filepath): 
+            new_filepath = os.path.join('data',folder,'labels',filename)
+            os.replace(existing_filepath, new_filepath)
+
+import albumentations as alb
+augmentor = alb.Compose(
+    [alb.RandomCrop(width=450, height=450), 
+     alb.HorizontalFlip(p=0.5), 
+     alb.RandomBrightnessContrast(p=0.2),
+     alb.RandomGamma(p=0.2), 
+     alb.RGBShift(p=0.2), 
+     alb.VerticalFlip(p=0.5)], 
+     bbox_params=alb.BboxParams(format='albumentations', label_fields=['class_labels'])
+)
+
+img = cv2.imread(os.path.join('data','train','images','ffd85fc5-cc1a-11ec-bfb8-a0cec8d2d278.jpg'))
+with open(os.path.join('data','train','labels','ffd85fc5-cc1a-11ec-bfb8-a0cec8d2d278.json'),'r') as f:
+    label = json.load(f)
+
+coords = [0,0,0,0]
+coords[0] = label['shapes'][0]['points'][0][0]
+coords[1] = label['shapes'][0]['points'][0][1]
+coords[2] = label['shapes'][0]['points'][1][0]
+coords[3] = label['shapes'][0]['points'][1][1]
+coords = list(np.divide(coords, [640,480,640,480]))
+
+augmented = augmentor(image=img, bboxes=[coords], class_labels=['face'])
+cv2.rectangle(augmented['image'], 
+              tuple(np.multiply(augmented['bboxes'][0][:2], [450,450]).astype(int)),
+              tuple(np.multiply(augmented['bboxes'][0][2:], [450,450]).astype(int)), 
+              (255,0,0), 2)
+
+plt.imshow(augmented['image'])
+
+for partition in ['train','test','val']: 
+    for image in os.listdir(os.path.join('data', partition, 'images')):
+        img = cv2.imread(os.path.join('data', partition, 'images', image))
+        coords = [0,0,0.00001,0.00001]
+        label_path = os.path.join('data', partition, 'labels', f'{image.split(".")[0]}.json')
+
+        if os.path.exists(label_path):
+            with open(label_path, 'r') as f:
+                label = json.load(f)
+            coords[0] = label['shapes'][0]['points'][0][0]
+            coords[1] = label['shapes'][0]['points'][0][1]
+            coords[2] = label['shapes'][0]['points'][1][0]
+            coords[3] = label['shapes'][0]['points'][1][1]
+            coords = list(np.divide(coords, [640,480,640,480]))
+
+        try:
+            for x in range(60):
+                augmented = augmentor(image=img, bboxes=[coords], class_labels=['face'])
+                cv2.imwrite(os.path.join('aug_data', partition, 'images', f'{image.split(".")[0]}.{x}.jpg'), augmented['image'])
+                annotation = {'image': image}
+
+                if os.path.exists(label_path):
+                    annotation['bbox'] = augmented['bboxes'][0] if len(augmented['bboxes'])>0 else [0,0,0,0]
+                    annotation['class'] = 1 if len(augmented['bboxes'])>0 else 0
+                else:
+                    annotation['bbox'] = [0,0,0,0]
+                    annotation['class'] = 0
+
+                with open(os.path.join('aug_data', partition, 'labels', f'{image.split(".")[0]}.{x}.json'), 'w') as f:
+                    json.dump(annotation, f)
+        except Exception as e:
+            print(e)
+
+train_images = tf.data.Dataset.list_files('aug_data\\train\\images\\*.jpg', shuffle=False)
+train_images = train_images.map(load_image).map(lambda x: tf.image.resize(x,(120,120))).map(lambda x: x/255)
+
+test_images = tf.data.Dataset.list_files('aug_data\\test\\images\\*.jpg', shuffle=False)
+test_images = test_images.map(load_image).map(lambda x: tf.image.resize(x,(120,120))).map(lambda x: x/255)
+
+val_images = tf.data.Dataset.list_files('aug_data\\val\\images\\*.jpg', shuffle=False)
+val_images = val_images.map(load_image).map(lambda x: tf.image.resize(x,(120,120))).map(lambda x: x/255)
+
+def load_labels(label_path):
+    with open(label_path.numpy(),'r',encoding="utf-8") as f:
+        label=json.load(f)
+    return [label['class']],label['bbox']
+
+train_labels = tf.data.Dataset.list_files('aug_data\\train\\labels\\*.json',shuffle=False)
+train_labels = train_labels.map(lambda x: tf.py_function(load_labels,[x],[tf.uint8,tf.float16]))
+
+test_labels = tf.data.Dataset.list_files('aug_data\\test\\labels\\*.json',shuffle=False)
+test_labels = test_labels.map(lambda x: tf.py_function(load_labels,[x],[tf.uint8,tf.float16]))
+
+val_labels = tf.data.Dataset.list_files('aug_data\\val\\labels\\*.json',shuffle=False)
+val_labels = val_labels.map(lambda x: tf.py_function(load_labels,[x],[tf.uint8,tf.float16]))
+
+train = tf.data.Dataset.zip((train_images,train_labels)).shuffle(5000).batch(8).prefetch(4)
+test = tf.data.Dataset.zip((test_images,test_labels)).shuffle(1300).batch(8).prefetch(4)
+val = tf.data.Dataset.zip((val_images,val_labels)).shuffle(1000).batch(8).prefetch(4)
+
+from tensorflow.keras.models import Model, load_model
+from tensorflow.keras.layers import Input, Dense, GlobalMaxPooling2D
+from tensorflow.keras.applications import VGG16
+
+def build_model(): 
+    input_layer = Input(shape=(120,120,3))
+    vgg = VGG16(include_top=False)(input_layer)
+
+    f1 = GlobalMaxPooling2D()(vgg)
+    class1 = Dense(2048, activation='relu')(f1)
+    class2 = Dense(1, activation='sigmoid')(class1)
+
+    f2 = GlobalMaxPooling2D()(vgg)
+    regress1 = Dense(2048, activation='relu')(f2)
+    regress2 = Dense(4, activation='sigmoid')(regress1)
+
+    facetracker = Model(inputs=input_layer, outputs=[class2, regress2])
+    return facetracker
+
+facetracker = build_model()
+X,y = train.as_numpy_iterator().next()
+classes,coords = facetracker.predict(X)
+
+batches_per_epoch=len(train)
+lr_decay=(1./0.75 -1)/batches_per_epoch
+opt=tf.keras.optimizers.Adam(learning_rate=0.0001,decay=lr_decay)
+
+def localization_loss(y_true,yhat):         
+    delta_coord=tf.reduce_sum(tf.square(y_true[:,:2]-yhat[:,:2]))
+    h_true=y_true[:,3]-y_true[:,1] 
+    w_true=y_true[:,2]-y_true[:,0] 
+    h_pred=yhat[:,3]-yhat[:,1] 
+    w_pred=yhat[:,2]-yhat[:,0] 
+    delta_size=tf.reduce_sum(tf.square(w_true-w_pred)+tf.square(h_true-h_pred))
+    return delta_coord+delta_size
+
+classloss=tf.keras.losses.BinaryCrossentropy()
+regressloss=localization_loss
+
+class FaceTracker(Model): 
+    def __init__(self, eyetracker, **kwargs): 
+        super().__init__(**kwargs)
+        self.model=eyetracker
+    def compile(self,opt,classloss,localizationloss,**kwargs):
+        super().compile(**kwargs)
+        self.closs=classloss
+        self.lloss=localizationloss
+        self.opt=opt
+    def train_step(self,batch,**kwargs):
+        X,y=batch
+        with tf.GradientTape() as tape: 
+            classes,coords=self.model(X,training=True)
+            total_loss=self.lloss(tf.cast(y[1],tf.float32),coords)+0.5*self.closs(y[0],classes)
+            grad=tape.gradient(total_loss,self.model.trainable_variables)
+        opt.apply_gradients(zip(grad,self.model.trainable_variables))
+        return {"total_loss":total_loss}
+    def test_step(self,batch,**kwargs): 
+        X,y=batch
+        classes,coords=self.model(X,training=False)
+        total_loss=self.lloss(tf.cast(y[1],tf.float32),coords)+0.5*self.closs(y[0],classes)
+        return {"total_loss":total_loss}
+    def call(self,X,**kwargs): 
+        return self.model(X,**kwargs)
+
+model=FaceTracker(facetracker)
+model.compile(opt,classloss,regressloss)
+hist=model.fit(train,epochs=10,validation_data=val)
+
+test_data=test.as_numpy_iterator()
+test_sample=test_data.next()
+yhat=facetracker.predict(test_sample[0])
+
+fig,ax=plt.subplots(ncols=4,figsize=(20,20))
+for idx in range(4):
+    sample_image=test_sample[0][idx]
+    sample_coords=yhat[1][idx]
+    if yhat[0][idx] >0.9:
+        cv2.rectangle(sample_image,
+        tuple(np.multiply(sample_coords[:2],[120,120]).astype(int)),
+        tuple(np.multiply(sample_coords[2:],[120,120]).astype(int)),(255,0,0),2)
+    ax[idx].imshow(sample_image)
+
+facetracker.save('facetracker.h5')
+facetracker=load_model('facetracker.h5')
+
+cap=cv2.VideoCapture(1)
+while cap.isOpen
